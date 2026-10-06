@@ -32,23 +32,29 @@ class ConcurrentPipeline:
     """
     流水线并发处理器 - 真正的并行架构
     
-    4个独立线程，每个拥有自己的事件循环，互不阻塞：
+    4个独立阶段，每个阶段拥有自己的线程池与事件循环，互不阻塞：
     1. 检测+OCR线程 → 完成后放入翻译队列和修复队列
     2. 翻译线程 → 批量处理翻译队列（HTTP 请求不会被 GPU 操作阻塞）
     3. 修复线程 → 处理修复队列（GPU 推理不会阻塞翻译）
     4. 渲染线程 → 翻译+修复完成后渲染出图
+
+    max_workers 控制每个阶段的工作线程数（1-8，默认 1）：
+    - 1：与旧行为一致，每阶段单线程串行处理；
+    - >1：检测按跨步分片、翻译/修复/渲染按队列并发，每阶段可同时处理多张图片。
     
-    batch_size 控制翻译批量大小（一次翻译多少张图片），
-    同时也限制等待翻译的队列长度，避免 API 太慢时检测/OCR 无限堆积。
+    batch_size 同时限制等待翻译的队列长度和每次提交给翻译器的图片数。
+    翻译线程会等到凑满 batch_size 再提交；检测+OCR全部结束后，会提交不足一批的剩余任务。
     
     使用 queue.Queue 和 threading.Lock 进行线程间通信和同步。
     """
+
+    MAX_WORKERS_LIMIT = 8
     
     def __init__(
         self,
         translator_instance,
         batch_size: int = 3,
-        max_workers: int = 4,
+        max_workers: int = 1,
         result_callback=None,
         progress_callback=None,
     ):
@@ -57,11 +63,16 @@ class ConcurrentPipeline:
         
         Args:
             translator_instance: MangaTranslator实例
-            batch_size: 批量大小（一次翻译多少张图片）
-            max_workers: 每个步骤的线程池大小
+            batch_size: 每次合并发送给翻译器的图片数上限
+            max_workers: 每个阶段（检测+OCR / 翻译 / 修复 / 渲染）的并行工作线程数，取值 1-8
         """
         self.translator = translator_instance
         self.batch_size = batch_size
+        try:
+            parsed_workers = int(max_workers or 1)
+        except (TypeError, ValueError):
+            parsed_workers = 1
+        self.max_workers = max(1, min(parsed_workers, self.MAX_WORKERS_LIMIT))
         # Optional bridge callback. It is invoked from the render worker after
         # one image has been saved, allowing a caller to stream that image
         # before the rest of the batch finishes.
@@ -70,10 +81,13 @@ class ConcurrentPipeline:
         
         # ✅ 为每个步骤创建独立的线程池，实现真正的并行处理
         # 每个线程拥有独立的事件循环，互不阻塞
-        self._detection_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='DetectionThread')
-        self._translation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='TranslationThread')
-        self._inpaint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='InpaintThread')
-        self._render_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='RenderThread')
+        self._detection_executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='DetectionThread')
+        self._translation_executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='TranslationThread')
+        self._inpaint_executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='InpaintThread')
+        self._render_executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='RenderThread')
+        # 各阶段工作线程的收尾计数（最后一个退出者负责置完成标志）
+        self._detection_workers_remaining = 0
+        self._translation_workers_remaining = 0
         
         # 线程安全的队列
         self.translation_queue = queue.Queue(maxsize=max(1, batch_size))  # 翻译队列（带背压）
@@ -119,6 +133,28 @@ class ConcurrentPipeline:
     def _emit_status(self, message: str):
         """向主线程发送状态消息（线程安全）"""
         self._status_queue.put(message)
+
+    def _bump_stat(self, name: str, amount: int = 1):
+        """线程安全地累加阶段计数（多 worker 并发时避免丢计数）。"""
+        with self._lock:
+            self.stats[name] = int(self.stats.get(name, 0)) + int(amount)
+
+    def _detection_worker_finished(self):
+        """检测+OCR 工作线程退出收尾；全部退出后置位检测完成标志。"""
+        with self._lock:
+            self._detection_workers_remaining = max(0, self._detection_workers_remaining - 1)
+            finished = self._detection_workers_remaining == 0
+        if finished:
+            self.detection_ocr_done = True
+            logger.info("[检测+OCR线程] 处理完成")
+
+    def _translation_worker_finished(self):
+        """翻译工作线程退出收尾；全部退出后置位翻译完成标志。"""
+        with self._lock:
+            self._translation_workers_remaining = max(0, self._translation_workers_remaining - 1)
+            finished = self._translation_workers_remaining == 0
+        if finished:
+            self.translation_thread_done = True
 
     def _notify_result(self, ctx):
         """Notify the optional consumer without breaking the pipeline."""
@@ -182,19 +218,6 @@ class ConcurrentPipeline:
             logger.error(f"[翻译] 找不到 {image_name} 的基础上下文")
             return None
         return ctx, config
-
-    def _should_translate_batch(self, batch: List[tuple]):
-        """根据图片数判断当前批次是否应该立刻翻译。"""
-        if not batch:
-            return False, ""
-
-        if len(batch) >= self.batch_size:
-            return True, f"批次已满 ({len(batch)}/{self.batch_size} 张图片)"
-
-        if self.detection_ocr_done:
-            return True, f"OCR完成，翻译剩余 {len(batch)} 张图片"
-
-        return False, ""
 
     def _enqueue_translation_task(self, image_name: str, config):
         """
@@ -280,18 +303,23 @@ class ConcurrentPipeline:
                 logger.warning(f"[并发流水线] SelectorEventLoop 创建失败，回退默认事件循环: {e}")
         return asyncio.new_event_loop()
     
-    def _detection_ocr_thread(self, file_paths: List[str], configs: List):
+    def _detection_ocr_thread(self, file_paths: List[str], configs: List,
+                              worker_index: int = 0, worker_count: int = 1):
         """
         检测+OCR工作线程（在独立线程中运行）
         完成后将上下文放入翻译队列和修复队列
         """
         self._emit_status("[检测+OCR] 线程启动")
         try:
-            self._run_async_in_thread(self._detection_ocr_async(file_paths, configs))
+            self._run_async_in_thread(
+                self._detection_ocr_async(file_paths, configs, worker_index, worker_count)
+            )
         finally:
             self._emit_status(f"[检测+OCR] 线程完成 ({self.stats['detection_ocr']}/{self.total_images})")
+            self._detection_worker_finished()
     
-    async def _detection_ocr_async(self, file_paths: List[str], configs: List):
+    async def _detection_ocr_async(self, file_paths: List[str], configs: List,
+                                   worker_index: int = 0, worker_count: int = 1):
         """检测+OCR的异步实现"""
         self._check_cancelled_or_raise("检测+OCR")
         
@@ -299,6 +327,8 @@ class ConcurrentPipeline:
         
         try:
             for idx, (file_path, config) in enumerate(zip(file_paths, configs)):
+                # 跨步分片时按全局序号显示进度
+                display_index = worker_index + idx * max(1, worker_count) + 1
                 self._check_cancelled_or_raise("检测+OCR", f"已处理 {idx}/{len(file_paths)} 张图片")
                 
                 # 检查是否需要停止（其他线程出错）
@@ -326,7 +356,7 @@ class ConcurrentPipeline:
                     ctx.save_quality = self.translator.save_quality
                     ctx.config = config
                     
-                    logger.info(f"[检测+OCR] 处理 {idx+1}/{self.total_images}: {ctx.image_name}")
+                    logger.info(f"[检测+OCR] 处理 {display_index}/{self.total_images}: {ctx.image_name}")
                     
                     # 检查取消
                     self._check_cancelled_or_raise("检测+OCR", f"已处理 {idx}/{len(file_paths)} 张图片")
@@ -382,10 +412,10 @@ class ConcurrentPipeline:
 
                     self._notify_progress(file_path, 'recognize', 'done', current_stage)
                     
-                    self.stats['detection_ocr'] += 1
+                    self._bump_stat('detection_ocr')
                     # ✅ 发送状态日志（每完成一张图）
                     text_count = len(ctx.text_regions) if ctx.text_regions else 0
-                    self._emit_status(f"[检测+OCR] 完成 {idx+1}/{self.total_images}: {os.path.basename(file_path)} ({text_count} 个文本块)")
+                    self._emit_status(f"[检测+OCR] 完成 {display_index}/{self.total_images}: {os.path.basename(file_path)} ({text_count} 个文本块)")
                     
                     # 保存图片尺寸
                     if hasattr(image, 'size'):
@@ -450,8 +480,8 @@ class ConcurrentPipeline:
                         self.translation_done[failed_ctx.image_name] = []
                         self.inpaint_done[failed_ctx.image_name] = True
 
-                    self.stats['detection_ocr'] += 1
-                    self._emit_status(f"[检测+OCR] 跳过失败文件 {idx+1}/{self.total_images}: {os.path.basename(file_path)}")
+                    self._bump_stat('detection_ocr')
+                    self._emit_status(f"[检测+OCR] 跳过失败文件 {display_index}/{self.total_images}: {os.path.basename(file_path)}")
                     self.render_queue.put((failed_ctx, config))
                     continue
                 except PipelineAbortError:
@@ -463,9 +493,7 @@ class ConcurrentPipeline:
             self.stop_workers = True
             raise
         finally:
-            # 标记检测+OCR全部完成
-            self.detection_ocr_done = True
-            logger.info("[检测+OCR线程] 处理完成")
+            logger.info("[检测+OCR线程] 分片处理完成")
     
     def _translation_thread(self):
         """翻译工作线程（在独立线程中运行）"""
@@ -475,13 +503,15 @@ class ConcurrentPipeline:
         finally:
             logger.info(f"[翻译线程] 线程完成 ({self.stats['translation']}/{self.total_images})")
             self._emit_status(f"[翻译] 线程完成 ({self.stats['translation']}/{self.total_images})")
+            self._translation_worker_finished()
     
     async def _translation_async(self):
         """翻译的异步实现"""
         batch = []
+        batch_limit = max(1, self.batch_size)
         try:
             self._check_cancelled_or_raise("翻译")
-            logger.info(f"[翻译线程] 启动，批量大小: {self.batch_size}")
+            logger.info(f"[翻译线程] 启动，每批目标: {batch_limit} 张，队列上限: {max(1, self.batch_size)}")
             
             while not self.stop_workers:
                 try:
@@ -491,36 +521,25 @@ class ConcurrentPipeline:
                         logger.warning(f"[翻译] 检测到严重错误，停止翻译 (已完成 {self.stats['translation']}/{self.total_images})")
                         break
                     
-                    # 从队列获取任务（非阻塞）
                     try:
                         task = self._pop_translation_task(timeout=0.1)
                         if task:
                             ctx, config = task
                             batch.append((ctx, config))
                     except queue.Empty:
-                        if not batch:
-                            if self.detection_ocr_done and self.translation_queue.empty():
-                                break
-                            if self.has_critical_error:
-                                logger.warning("[翻译] 检测到严重错误，停止等待")
-                                break
-                            continue
-                    
-                    # 收集更多图片直到达到 batch_size
-                    while len(batch) < self.batch_size:
-                        try:
-                            task = self._pop_translation_task(timeout=0.05)
-                            if task:
-                                ctx, config = task
-                                batch.append((ctx, config))
-                        except queue.Empty:
+                        if self.detection_ocr_done and self.translation_queue.empty():
+                            if batch:
+                                logger.info(f"[翻译] 检测+OCR已完成，提交不足一批的剩余任务 ({len(batch)} 张图片)")
+                                await self._process_translation_batch(batch)
+                                batch = []
                             break
-                    
-                    # 判断是否应该翻译当前批次
-                    should_translate, reason = self._should_translate_batch(batch)
+                        if self.has_critical_error:
+                            logger.warning("[翻译] 检测到严重错误，停止等待")
+                            break
+                        continue
 
-                    if should_translate:
-                        logger.info(f"[翻译] {reason}，开始翻译 ({len(batch)} 张图片)")
+                    if len(batch) >= batch_limit:
+                        logger.info(f"[翻译] 已凑满后端批量大小，提交当前批次 ({len(batch)} 张图片)")
                         await self._process_translation_batch(batch)
                         batch = []
                     
@@ -554,7 +573,6 @@ class ConcurrentPipeline:
         except PipelineAbortError:
             self.stop_workers = True
         finally:
-            self.translation_thread_done = True
             logger.info("[翻译线程] 停止")
     
     async def _process_translation_batch(self, batch: List[tuple]):
@@ -585,7 +603,7 @@ class ConcurrentPipeline:
             translated_batch = await self.translator._batch_translate_contexts(batch, len(batch))
             self._check_cancelled_or_raise("翻译", f"批量翻译 {len(batch)} 张图片")
             
-            self.stats['translation'] += len(batch)
+            self._bump_stat('translation', len(batch))
             # ✅ 发送状态日志
             self._emit_status(f"[翻译] 批次完成 ({self.stats['translation']}/{self.total_images})")
             
@@ -654,7 +672,7 @@ class ConcurrentPipeline:
             logger.error(f"[翻译] 异常类型: {type(e).__name__}")
             logger.error(traceback.format_exc())
 
-            self.stats['translation'] += len(batch)
+            self._bump_stat('translation', len(batch))
             self._emit_status(f"[翻译] 跳过失败批次 ({self.stats['translation']}/{self.total_images})")
 
             for ctx, config in batch:
@@ -756,7 +774,7 @@ class ConcurrentPipeline:
                             if ctx.image_name in self.translation_done:
                                 self.render_queue.put((ctx, config))
                         if not is_redo:
-                            self.stats['inpaint'] += 1
+                            self._bump_stat('inpaint')
                             inpaint_count += 1
                             self._emit_status(f"[修复] 跳过失败文件 {inpaint_count}/{self.total_images}: {os.path.basename(ctx.image_name)}")
                         continue
@@ -790,7 +808,7 @@ class ConcurrentPipeline:
                     self._notify_progress(ctx.image_name, 'inpaint', 'done', 'redo-complete' if is_redo else 'complete')
 
                     if not is_redo:
-                        self.stats['inpaint'] += 1
+                        self._bump_stat('inpaint')
                         inpaint_count += 1
                         self._emit_status(f"[修复] 完成 {inpaint_count}/{self.total_images}: {os.path.basename(ctx.image_name)}")
                     else:
@@ -870,7 +888,7 @@ class ConcurrentPipeline:
                                 self.render_queue.put((ctx, config))
 
                     if not is_redo:
-                        self.stats['inpaint'] += 1
+                        self._bump_stat('inpaint')
                         inpaint_count += 1
                         self._emit_status(f"[修复] 跳过失败文件 {inpaint_count}/{self.total_images}: {os.path.basename(ctx.image_name)}")
                     else:
@@ -904,7 +922,7 @@ class ConcurrentPipeline:
         rendered_count = 0
         
         try:
-            while not self.stop_workers or rendered_count < self.total_images:
+            while not self.stop_workers or self.stats['rendering'] < self.total_images:
                 ctx = None
                 config = None
                 current_stage = 'rendering'
@@ -923,7 +941,7 @@ class ConcurrentPipeline:
                         if self.stop_workers:
                             logger.info(f"[渲染] 收到停止信号，已渲染 {rendered_count}/{self.total_images} 张图片")
                             break
-                        if rendered_count >= self.total_images:
+                        if self.stats['rendering'] >= self.total_images:
                             break
                         if self.has_critical_error:
                             logger.warning("[渲染] 检测到严重错误，停止等待")
@@ -945,7 +963,7 @@ class ConcurrentPipeline:
                     if getattr(ctx, 'translation_error', None):
                         self._notify_progress(ctx.image_name, 'render', 'skipped', 'translation-failed')
                         self._record_failed_image(ctx.image_name)
-                        self.stats['rendering'] += 1
+                        self._bump_stat('rendering')
                         rendered_count += 1
                         self._emit_status(f"[渲染] 跳过失败文件 {rendered_count}/{self.total_images}: {os.path.basename(ctx.image_name)}")
 
@@ -964,7 +982,7 @@ class ConcurrentPipeline:
                         self._notify_progress(ctx.image_name, 'render', 'error', 'missing-image-data', '缺少原始图片数据')
                         ctx = self.translator._mark_context_failure(ctx, RuntimeError("缺少原始图片数据"), stage='rendering')
                         self._record_failed_image(ctx.image_name)
-                        self.stats['rendering'] += 1
+                        self._bump_stat('rendering')
                         rendered_count += 1
                         self._emit_status(f"[渲染] 跳过失败文件 {rendered_count}/{self.total_images}: {os.path.basename(ctx.image_name)}")
                         with self._results_lock:
@@ -1005,7 +1023,7 @@ class ConcurrentPipeline:
                             render_alpha=getattr(ctx, 'img_render_alpha', None),
                         )
                     
-                    self.stats['rendering'] += 1
+                    self._bump_stat('rendering')
                     rendered_count += 1
                     
                     # ✅ 发送状态日志（每完成一张图）
@@ -1091,7 +1109,7 @@ class ConcurrentPipeline:
                     if ctx is not None:
                         ctx = self.translator._mark_context_failure(ctx, e, stage='rendering')
                         self._record_failed_image(ctx.image_name)
-                        self.stats['rendering'] += 1
+                        self._bump_stat('rendering')
                         rendered_count += 1
                         self._emit_status(f"[渲染] 跳过失败文件 {rendered_count}/{self.total_images}: {os.path.basename(ctx.image_name)}")
                         with self._results_lock:
@@ -1133,7 +1151,10 @@ class ConcurrentPipeline:
         self.start_time = datetime.now(timezone.utc)
         
         logger.info(f"[并发流水线] 开始处理 {self.total_images} 张图片")
-        logger.info("[并发流水线] 真正并行模式: 4个独立线程（检测+OCR / 翻译 / 修复 / 渲染）")
+        logger.info(
+            f"[并发流水线] 并行模式: 每阶段 {self.max_workers} 个工作线程"
+            "（检测+OCR / 翻译 / 修复 / 渲染）"
+        )
         
         # 重置统计
         for key in self.stats:
@@ -1150,6 +1171,8 @@ class ConcurrentPipeline:
         self.critical_error_msg = None
         self.critical_error_exception = None
         self._results = []
+        self._detection_workers_remaining = self.max_workers
+        self._translation_workers_remaining = self.max_workers
         
         # 将 stop_workers 纳入统一取消回调，确保 in-flight API 也能尽快响应停止
         original_cancel_callback = getattr(self.translator, "_cancel_check_callback", None)
@@ -1168,13 +1191,28 @@ class ConcurrentPipeline:
                 return False
             self.translator.set_cancel_check_callback(_pipeline_cancel_check)
         
-        # 提交4个独立线程任务
-        futures = [
-            self._detection_executor.submit(self._detection_ocr_thread, file_paths, configs),
-            self._translation_executor.submit(self._translation_thread),
-            self._inpaint_executor.submit(self._inpaint_thread),
-            self._render_executor.submit(self._render_thread),
-        ]
+        # 按阶段提交工作线程：每个阶段 max_workers 个；检测按跨步分片。
+        # max_workers=1 时与旧行为完全一致（4 个独立线程，各阶段单线程串行）。
+        futures = []
+        future_names = []
+        for worker_index in range(self.max_workers):
+            futures.append(self._detection_executor.submit(
+                self._detection_ocr_thread,
+                file_paths[worker_index::self.max_workers],
+                configs[worker_index::self.max_workers],
+                worker_index,
+                self.max_workers,
+            ))
+            future_names.append("检测+OCR")
+        for _ in range(self.max_workers):
+            futures.append(self._translation_executor.submit(self._translation_thread))
+            future_names.append("翻译")
+        for _ in range(self.max_workers):
+            futures.append(self._inpaint_executor.submit(self._inpaint_thread))
+            future_names.append("修复")
+        for _ in range(self.max_workers):
+            futures.append(self._render_executor.submit(self._render_thread))
+            future_names.append("渲染")
         
         try:
             # 等待所有线程完成（在外部循环中检查以便响应取消）
@@ -1219,8 +1257,7 @@ class ConcurrentPipeline:
                 thread_names = []
                 for i, future in enumerate(futures):
                     if future in not_done:
-                        names = ["检测+OCR", "翻译", "修复", "渲染"]
-                        thread_names.append(names[i])
+                        thread_names.append(future_names[i])
                 logger.warning(f"[并发流水线] {len(not_done)} 个线程未能在10秒内停止: {', '.join(thread_names)}")
             else:
                 logger.info("[并发流水线] 所有线程已停止")
@@ -1237,8 +1274,7 @@ class ConcurrentPipeline:
                 thread_names = []
                 for i, future in enumerate(futures):
                     if future in not_done:
-                        names = ["检测+OCR", "翻译", "修复", "渲染"]
-                        thread_names.append(names[i])
+                        thread_names.append(future_names[i])
                 logger.warning(f"[并发流水线] {len(not_done)} 个线程未能在10秒内停止: {', '.join(thread_names)}")
             else:
                 logger.info("[并发流水线] 所有线程已停止")
