@@ -3751,6 +3751,7 @@ class MangaTranslator:
                 self,
                 batch_size,
                 result_callback=getattr(self, '_stream_result_callback', None),
+                progress_callback=getattr(self, '_stream_progress_callback', None),
             )
             file_paths = [input_path(item) for item in images_with_configs]
             configs = [item[1] for item in images_with_configs]
