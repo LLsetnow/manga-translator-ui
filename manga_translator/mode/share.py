@@ -38,7 +38,6 @@ MAX_LOG_READ_BYTES = 128 * 1024
 PROCESS_DIR_NAME = ".immersive-translate"
 CACHE_WRITE_LOCK = Lock()
 SHARED_BACKEND_PROTOCOL = "manga-translator-ui-shared-v2"
-BROWSER_MANGA_BATCH_WINDOW_SIZE = 10
 PAGE_PROGRESS_VERSION = 1
 PAGE_PROGRESS_TRACE_PATH = FilePath(tempfile.gettempdir()) / "immersive-translate" / "page-progress.jsonl"
 
@@ -551,11 +550,6 @@ class MangaShare:
             entries = payload.get("images")
             if not isinstance(entries, list) or not entries:
                 raise HTTPException(status_code=422, detail="批量翻译没有图片")
-            if len(entries) > BROWSER_MANGA_BATCH_WINDOW_SIZE:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"单次批量翻译最多支持{BROWSER_MANGA_BATCH_WINDOW_SIZE}张图片",
-                )
 
             output_path = self._resolve_output_folder(payload.get("outputFolder", ""))
             process_root = _process_root(output_path)
